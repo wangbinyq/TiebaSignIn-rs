@@ -39,7 +39,7 @@ struct FollowRes {
 #[derive(Deserialize)]
 struct SignRes {
     error_code: String,
-    error_msg: String,
+    error_msg: Option<String>,
 }
 
 impl App {
@@ -132,7 +132,10 @@ impl App {
         if res.error_code == "0" {
             Ok(())
         } else {
-            bail!(res.error_msg)
+            match res.error_msg {
+                Some(error_msg) => bail!(error_msg),
+                None => bail!("错误码: {}", res.error_code),
+            }
         }
     }
 }
