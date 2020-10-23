@@ -2,8 +2,13 @@
 extern crate log;
 
 use anyhow::{bail, Result};
-use reqwest::{blocking::Client, header};
+use futures::future::join_all;
+use reqwest::{header, Client};
 use serde::Deserialize;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 const LIKE_URL: &str = "https://tieba.baidu.com/mo/q/newmoindex";
 const TBS_URL: &str = "http://tieba.baidu.com/dc/common/tbs";
@@ -60,23 +65,33 @@ impl App {
         }
     }
 
-    pub fn run(&mut self) {
-        match self.get_tbs().and_then(|_| self.get_follows()) {
+    pub async fn run(&mut self) {
+        if self.get_tbs().await.is_err() {
+            return;
+        };
+        match self.get_follows().await {
             Ok(follows) => {
                 info!("开始签到...");
                 let total = follows.len();
-                let success = follows
-                    .iter()
-                    .fold(0, |acc, follow| match self.run_sign(follow) {
-                        Ok(_) => {
-                            info!("{} 签到成功", follow);
-                            acc + 1
-                        }
-                        Err(err) => {
-                            error!("{} 签到失败: {}", follow, err);
-                            acc
-                        }
-                    });
+                let success = Arc::new(AtomicUsize::new(0));
+                join_all(
+                    follows
+                        .iter()
+                        .map(|follow| (follow.clone(), self.run_sign(follow), success.clone()))
+                        .map(|(follow, result, success)| async move {
+                            match result.await {
+                                Ok(_) => {
+                                    info!("{} 签到成功", follow);
+                                    success.fetch_add(1, Ordering::SeqCst);
+                                }
+                                Err(err) => {
+                                    error!("{} 签到失败: {}", follow, err);
+                                }
+                            }
+                        }),
+                )
+                .await;
+                let success = success.load(Ordering::SeqCst);
                 info!(
                     "第 {} 个账号签到完成, 成功 {} 个, 失败: {} 个",
                     self.idx,
@@ -88,10 +103,10 @@ impl App {
         }
     }
 
-    fn get_tbs(&mut self) -> Result<()> {
+    async fn get_tbs(&mut self) -> Result<()> {
         info!("第 {} 个账号登陆中...", self.idx);
 
-        let response: TbsRes = self.client.get(TBS_URL).send()?.json()?;
+        let response: TbsRes = self.client.get(TBS_URL).send().await?.json().await?;
 
         if response.is_login != 1 {
             bail!("登录失败")
@@ -102,9 +117,9 @@ impl App {
         }
     }
 
-    fn get_follows(&self) -> Result<Vec<String>> {
+    async fn get_follows(&self) -> Result<Vec<String>> {
         info!("开始获取贴吧列表...");
-        let response: FollowRes = self.client.get(LIKE_URL).send()?.json()?;
+        let response: FollowRes = self.client.get(LIKE_URL).send().await?.json().await?;
         let follows: Vec<String> = response
             .data
             .like_forum
@@ -117,7 +132,7 @@ impl App {
         Ok(follows)
     }
 
-    fn run_sign(&self, follow: &str) -> Result<()> {
+    async fn run_sign(&self, follow: &str) -> Result<()> {
         let sign = format!("kw={}tbs={}tiebaclient!!!", follow, self.tbs);
         let sign: md5::Digest = md5::compute(sign);
         let body = format!("kw={}&tbs={}&sign={:x}", follow, self.tbs, sign);
@@ -126,8 +141,10 @@ impl App {
             .client
             .post(SIGN_URL)
             .body(body)
-            .send()?
-            .json::<SignRes>()?;
+            .send()
+            .await?
+            .json::<SignRes>()
+            .await?;
 
         if res.error_code == "0" {
             Ok(())
@@ -140,15 +157,14 @@ impl App {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::init();
 
     let bduss_list = option_env!("BDUSS").expect("请设置BDUSS");
 
-    bduss_list
-        .split("&")
-        .enumerate()
-        .for_each(|(idx, bduss)| App::new(bduss, idx + 1).run());
-
+    for (idx, bduss) in bduss_list.split("&").enumerate() {
+        App::new(bduss, idx + 1).run().await;
+    }
     Ok(())
 }
